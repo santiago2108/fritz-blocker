@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=FritzBox Blocker
+Comment=Block devices on the home network
+Exec=/home/santiagocal09/Downloads/fritz_blocker_webapp/start_fritz_blocker.sh
+Icon=network-wired
+Terminal=false
+Type=Application
+Categories=Utility;
