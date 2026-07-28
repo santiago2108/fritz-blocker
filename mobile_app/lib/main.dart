@@ -1,7 +1,10 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'fritz_client.dart';
+
+const routerIp = '192.168.178.1';
+const routerUser = 'fritz5913';
 
 void main() => runApp(const FritzBlockerApp());
 
@@ -26,36 +29,46 @@ class FritzBlockerApp extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class ApiClient {
-  final String baseUrl;
-  final String cookie;
+  final FritzTr064Client _client;
 
-  const ApiClient({required this.baseUrl, required this.cookie});
+  const ApiClient(this._client);
 
-  Map<String, String> get _headers => {
-        'Content-Type': 'application/json',
-        'Cookie': cookie,
-      };
+  void close() => _client.close();
 
   Future<List<Device>> fetchDevices() async {
-    final res = await http
-        .get(Uri.parse('$baseUrl/api/devices'), headers: _headers)
-        .timeout(const Duration(seconds: 10));
-    if (res.statusCode == 401) throw const AuthException();
-    if (res.statusCode != 200) throw Exception('Server error ${res.statusCode}');
-    final list = jsonDecode(res.body) as List;
-    return list.map((j) => Device.fromJson(j as Map<String, dynamic>)).toList();
+    try {
+      final hosts = await _client.getHostsInfo();
+      final devices = <Device>[];
+      for (final h in hosts) {
+        bool blocked = false;
+        try {
+          blocked = await _client.isBlocked(h.ip);
+        } on FritzSoapException {
+          // some hosts (e.g. the router itself) don't support the filter
+          // query; treat as unblocked rather than failing the whole list.
+        }
+        devices.add(Device(
+          name: h.name.isEmpty ? h.ip : h.name,
+          ip: h.ip,
+          mac: h.mac,
+          active: h.active,
+          blocked: blocked,
+        ));
+      }
+      return devices;
+    } on FritzAuthException {
+      throw const AuthException();
+    }
   }
 
   Future<void> setBlocked(List<String> ips, {required bool block}) async {
-    final res = await http
-        .post(
-          Uri.parse('$baseUrl/api/block'),
-          headers: _headers,
-          body: jsonEncode({'ips': ips, 'block': block}),
-        )
-        .timeout(const Duration(seconds: 10));
-    if (res.statusCode == 401) throw const AuthException();
-    if (res.statusCode != 200) throw Exception('Server error ${res.statusCode}');
+    try {
+      for (final ip in ips) {
+        await _client.setBlocked(ip, block);
+      }
+    } on FritzAuthException {
+      throw const AuthException();
+    }
   }
 }
 
@@ -82,14 +95,6 @@ class Device {
     required this.blocked,
   });
 
-  factory Device.fromJson(Map<String, dynamic> j) => Device(
-        name: (j['name'] as String?) ?? j['ip'] as String,
-        ip: j['ip'] as String,
-        mac: (j['mac'] as String?) ?? '',
-        active: (j['active'] as bool?) ?? false,
-        blocked: (j['blocked'] as bool?) ?? false,
-      );
-
   bool get isAmazon => name.toLowerCase().contains('amazon');
 }
 
@@ -105,7 +110,6 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _serverCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   bool _loading = false;
   String? _error;
@@ -113,20 +117,22 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void initState() {
     super.initState();
-    _loadSavedServer();
+    _init();
   }
 
-  Future<void> _loadSavedServer() async {
+  Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('server_url');
-    if (saved != null) setState(() => _serverCtrl.text = saved);
+    final savedPassword = prefs.getString('password');
+    if (savedPassword != null) {
+      _passCtrl.text = savedPassword;
+      await _login();
+    }
   }
 
   Future<void> _login() async {
-    final url = _serverCtrl.text.trim().replaceAll(RegExp(r'/$'), '');
     final password = _passCtrl.text;
-    if (url.isEmpty || password.isEmpty) {
-      setState(() => _error = 'Enter server URL and password.');
+    if (password.isEmpty) {
+      setState(() => _error = 'Enter the router password.');
       return;
     }
     setState(() {
@@ -134,35 +140,26 @@ class _LoginPageState extends State<LoginPage> {
       _error = null;
     });
 
+    final fritzClient =
+        FritzTr064Client(host: routerIp, user: routerUser, password: password);
     try {
-      final res = await http.post(
-        Uri.parse('$url/login'),
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: {'password': password},
-      ).timeout(const Duration(seconds: 10));
+      await fritzClient.getHostsInfo(); // sanity check the credentials work
 
-      final landed = res.request?.url.path ?? '';
-      final setCookie = res.headers['set-cookie'] ?? '';
-      if (!landed.contains('devices') || setCookie.isEmpty) {
-        setState(() => _error = 'Login failed. Check the password.');
-        return;
-      }
-
-      final cookie = setCookie.split(';').first;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('server_url', url);
+      await prefs.setString('password', password);
 
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => DevicesPage(
-            client: ApiClient(baseUrl: url, cookie: cookie),
-            serverUrl: url,
-          ),
+          builder: (_) => DevicesPage(client: ApiClient(fritzClient)),
         ),
       );
+    } on FritzAuthException {
+      fritzClient.close();
+      setState(() => _error = 'Login failed. Check the password.');
     } catch (e) {
-      setState(() => _error = 'Could not reach server. Check the URL.');
+      fritzClient.close();
+      setState(() => _error = 'Could not reach the router. Check your WiFi.');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -184,16 +181,6 @@ class _LoginPageState extends State<LoginPage> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 32),
-              TextField(
-                controller: _serverCtrl,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: 'Server URL',
-                  hintText: 'http://192.168.x.x:5000',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
               TextField(
                 controller: _passCtrl,
                 obscureText: true,
@@ -233,9 +220,8 @@ class _LoginPageState extends State<LoginPage> {
 
 class DevicesPage extends StatefulWidget {
   final ApiClient client;
-  final String serverUrl;
 
-  const DevicesPage({super.key, required this.client, required this.serverUrl});
+  const DevicesPage({super.key, required this.client});
 
   @override
   State<DevicesPage> createState() => _DevicesPageState();
@@ -357,10 +343,9 @@ class _DevicesPageState extends State<DevicesPage> {
             onSelected: (v) async {
               if (v == 'logout') {
                 final navigator = Navigator.of(context);
-                await http.post(
-                  Uri.parse('${widget.serverUrl}/logout'),
-                  headers: {'Cookie': widget.client.cookie},
-                );
+                widget.client.close();
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.remove('password');
                 if (!mounted) return;
                 navigator.pushReplacement(
                   MaterialPageRoute(builder: (_) => const LoginPage()),
